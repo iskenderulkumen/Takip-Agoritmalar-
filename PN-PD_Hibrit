@@ -1,0 +1,290 @@
+import time
+import cv2
+import numpy as np
+from typing import cast
+from filterpy.kalman import KalmanFilter
+from ultralytics import YOLO
+from pymavlink import mavutil
+
+MODEL_YOLU = "yolov11s_drone_best.pt"          
+GUVEN_ESIGI = 0.5
+
+FRAME_GENISLIK = 640
+FRAME_YUKSEKLIK = 480
+
+
+GSTREAMER_PIPELINE = (
+    "udpsrc port=5600 caps=application/x-rtp,encoding-name=H264,payload=96 "
+    "! rtph264depay ! h264parse ! avdec_h264 "
+    "! videoconvert ! appsink drop=1 sync=false"
+)
+
+MAVLINK_PORT = "/dev/ttyAMA0"
+MAVLINK_BAUD = 921600
+
+ROLL_KOMUT_SINIRI = 1.0       
+PITCH_HATA_SINIRI = FRAME_YUKSEKLIK / 2.0
+ALAN_HATA_SINIRI = 6000.0    
+
+
+def create_kalman(dt=0.033):
+    kf = KalmanFilter(dim_x=4, dim_z=2)
+    kf.F = np.array([[1, 0, dt, 0],
+                      [0, 1, 0, dt],
+                      [0, 0, 1, 0],
+                      [0, 0, 0, 1]])
+    kf.H = np.array([[1, 0, 0, 0],
+                      [0, 1, 0, 0]])
+    kf.P *= 500.
+    kf.R = np.eye(2) * 5
+    kf.Q = np.eye(4) * 0.05
+    kf.x = np.array([320., 240., 0., 0.])
+    return kf
+def _to_numpy(deger):
+    if hasattr(deger, "cpu"):
+        return deger.cpu().numpy()
+    return np.asarray(deger)
+
+
+class ByteTrackTakipci:
+    def __init__(self, model_yolu=MODEL_YOLU, guven_esigi=GUVEN_ESIGI):
+        self.model = YOLO(model_yolu)
+        self.guven_esigi = guven_esigi
+        self.kilitli_id = None
+
+    def kilidi_sifirla(self):
+        self.kilitli_id = None
+
+    def kare_isle(self, frame):
+        sonuc = self.model.track(
+            frame,
+            conf=self.guven_esigi,
+            tracker="bytetrack.yaml",
+            persist=True,
+            verbose=False,
+        )[0]
+
+        kutular = sonuc.boxes
+        if kutular is None or len(kutular) == 0 or kutular.id is None:
+            return False, None, None, None, None, None
+
+        id_listesi = _to_numpy(kutular.id).astype(int)
+        guven_listesi = _to_numpy(kutular.conf)
+        xyxy_listesi = _to_numpy(kutular.xyxy)
+
+        if self.kilitli_id is None:
+            secilen_index = int(np.argmax(guven_listesi))
+            self.kilitli_id = int(id_listesi[secilen_index])
+        else:
+            eslesme = np.where(id_listesi == self.kilitli_id)[0]
+            if len(eslesme) == 0:
+                return False, None, None, None, None, None
+            secilen_index = int(eslesme[0])
+
+        x1, y1, x2, y2 = xyxy_listesi[secilen_index]
+        guven = float(guven_listesi[secilen_index])
+
+        x_merkez = float((x1 + x2) / 2.0)
+        y_merkez = float((y1 + y2) / 2.0)
+        genislik = float(x2 - x1)
+        yukseklik = float(y2 - y1)
+
+        return True, x_merkez, y_merkez, genislik, yukseklik, guven
+
+class TakipKontrolcu:
+    def __init__(self, N=3.0, Kp=0.004, Kd=0.002, genislik=640, yukseklik=480):
+        self.N = N
+        self.Kp = Kp
+        self.Kd = Kd
+        self.x_ekran_ortasi = genislik / 2
+        self.y_ekran_ortasi = yukseklik / 2
+        self.onceki_los = None
+        self.onceki_x_hatasi = 0.0
+        self.onceki_alan = None
+        self.onceki_zaman = time.time()
+
+    def update(self, x_hedef_ortasi, y_hedef_ortasi, bbox_alani, referans_alan=6000):
+        simdi = time.time()
+        sure_farki = max(simdi - self.onceki_zaman, 1e-3)
+
+        x_hata = x_hedef_ortasi - self.x_ekran_ortasi
+        y_hata = y_hedef_ortasi - self.y_ekran_ortasi
+
+        los = np.arctan2(y_hata, x_hata)
+        if self.onceki_los is not None:
+            fark = los - self.onceki_los
+            fark = np.arctan2(np.sin(fark), np.cos(fark))
+            los_hizi = fark / sure_farki
+        else:
+            los_hizi = 0.0
+
+        if self.onceki_alan is not None:
+            Vc = -(bbox_alani - self.onceki_alan) / sure_farki
+        else:
+            Vc = 0.0
+
+        Pn_ivme = self.N * los_hizi * Vc
+        x_hata_hizi = (x_hata - self.onceki_x_hatasi) / sure_farki
+        Pd_ivme = self.Kp * x_hata + self.Kd * x_hata_hizi
+
+        roll_komutu = Pd_ivme + Pn_ivme
+
+        alan_hatasi = bbox_alani - referans_alan
+
+        self.onceki_los = los
+        self.onceki_x_hatasi = x_hata
+        self.onceki_alan = bbox_alani
+        self.onceki_zaman = simdi
+
+        return roll_komutu, y_hata, alan_hatasi
+
+def main_loop():
+    kalman = create_kalman()
+    kontrolcu = TakipKontrolcu(N=3.0, Kp=0.004, Kd=0.002, genislik=640, yukseklik=480)
+    takipci = ByteTrackTakipci()
+    kilitli = False
+
+    kamera = cv2.VideoCapture(GSTREAMER_PIPELINE, cv2.CAP_GSTREAMER)
+    if not kamera.isOpened():
+        raise RuntimeError("GStreamer kamera pipeline'i acilamadi.")
+
+    try:
+        while True:
+            okundu, frame = kamera.read()
+            if not okundu:
+                time.sleep(0.01)
+                continue
+
+            tespit_var, x_hedef_ortasi, y_hedef_ortasi, genislik, yukseklik, guven = yolo_kare_al(
+                frame, takipci
+            )
+
+            kalman.predict()  
+
+            if tespit_var and guven is not None and guven > 0.5 and x_hedef_ortasi is not None and y_hedef_ortasi is not None:
+                x_konum = float(x_hedef_ortasi)
+                y_konum = float(y_hedef_ortasi)
+                kalman.update([x_konum, y_konum])
+                kilitli = True
+            elif kilitli:
+                x_konum = float(kalman.x[0])
+                y_konum = float(kalman.x[1])   
+            else:
+                run_lawnmower_search()
+                continue
+
+            if tespit_var:
+                if genislik is None or yukseklik is None:
+                    tespit_var = False
+                    bbox_alani = kontrolcu.onceki_alan
+                else:
+                    bbox_alani = float(genislik) * float(yukseklik)
+            else:
+                bbox_alani = kontrolcu.onceki_alan
+
+            if bbox_alani is None:
+                run_lawnmower_search()
+                continue
+
+            roll, pitch_hatasi, alan_hatasi = kontrolcu.update(
+                x_konum, y_konum, bbox_alani, referans_alan=6000
+            )
+
+            ucus_kontrolcusune_gonder(roll, pitch_hatasi, alan_hatasi)
+
+            time.sleep(0.03)  
+    finally:
+        kamera.release()
+
+def yolo_kare_al(frame, takipci: ByteTrackTakipci):
+    return takipci.kare_isle(frame)
+
+
+arama_rotasi = None
+arama_indeksi = 0
+arama_yolu = None
+
+
+def mavlink_baglantisini_al():
+    global arama_yolu
+    if arama_yolu is None:
+        arama_yolu = mavutil.mavlink_connection(MAVLINK_PORT, baud=MAVLINK_BAUD)
+        arama_yolu.wait_heartbeat()
+    return arama_yolu
+
+
+def lawnmower_rotayi_olustur(satir_sayisi=6, satir_uzunlugu_m=20.0, hat_araligi_m=4.0):
+    rota = []
+    for satir in range(satir_sayisi):
+        y = satir * hat_araligi_m
+        if satir % 2 == 0:
+            rota.append((satir_uzunlugu_m, y))
+        else:
+            rota.append((0.0, y))
+    return rota
+
+
+def lawnmower_hedefe_ulasildi_mi(master, hedef_x, hedef_y, tolerans_m=1.0):
+    mesaj = master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
+    if mesaj is None:
+        return False
+    fark = np.hypot(mesaj.x - hedef_x, mesaj.y - hedef_y)
+    return fark < tolerans_m
+
+
+def run_lawnmower_search():
+    global arama_rotasi, arama_indeksi
+
+    master = mavlink_baglantisini_al()
+
+    if arama_rotasi is None:
+        arama_rotasi = lawnmower_rotayi_olustur()
+        arama_indeksi = 0
+
+    hedef_x, hedef_y = arama_rotasi[arama_indeksi]
+
+    type_mask = 0b0000111111111000
+    master.mav.set_position_target_local_ned_send(
+        int(time.time() * 1000) & 0xFFFFFFFF,
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+        type_mask,
+        hedef_x, hedef_y, 0.0,   
+        0, 0, 0,                 
+        0, 0, 0,                 
+        0, 0,                    
+    )
+
+    if lawnmower_hedefe_ulasildi_mi(master, hedef_x, hedef_y):
+        arama_indeksi = (arama_indeksi + 1) % len(arama_rotasi)
+
+    time.sleep(0.03)
+
+
+def normalize(deger, sinir):
+    deger = max(min(deger, sinir), -sinir)
+    return deger / sinir
+
+
+def ucus_kontrolcusune_gonder(roll, pitch_hatasi, alan_hatasi):
+    master = mavlink_baglantisini_al()
+
+    roll_norm = normalize(roll, ROLL_KOMUT_SINIRI)
+    pitch_norm = normalize(pitch_hatasi, PITCH_HATA_SINIRI)
+    alan_norm = normalize(alan_hatasi, ALAN_HATA_SINIRI)
+
+    try:
+        master.mav.abra_fpv_send(
+            int(time.time() * 1000) & 0xFFFFFFFF,   
+            float(roll_norm),                       
+            float(pitch_norm),                     
+            float(alan_norm),                       
+            1,                                      
+        )
+    except AttributeError:
+        print("[UYARI] ABRA_FPV mesaj tanimi bulunamadi")
+
+
+if __name__ == "__main__":
+    main_loop()
